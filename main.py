@@ -1,83 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import time
 import numpy as np
-import matplotlib.pyplot as plt
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from battery_mpc_lib import (
-    Module,
     SoHModelParams,
-    build_pack_current_profile,
-    solve_system_v1,
-    run_classical_controller,
-    run_mpc_controller,
-    plot_comparison,
-    summarize_results,
+    run_single_test,
+    aggregate_results,
+    plot_best_test_trajectories,
 )
 
 
-def create_modules():
-    modules = np.empty(3, dtype=object)
-
-    modules[0] = Module(
-        soc=0.40, soh=100.0, imax=50.0,
-        soc_min=0.20, soc_max=0.90,
-        capacity_nominal_ah=50.0,
-        module_id="M1"
-    )
-    modules[1] = Module(
-        soc=0.50, soh=90.0, imax=50.0,
-        soc_min=0.20, soc_max=0.85,
-        capacity_nominal_ah=50.0,
-        module_id="M2"
-    )
-    modules[2] = Module(
-        soc=0.30, soh=80.0, imax=50.0,
-        soc_min=0.20, soc_max=0.80,
-        capacity_nominal_ah=50.0,
-        module_id="M3"
-    )
-
-    return modules
-
-
-def print_run_header():
-    print("=" * 72)
-    print("Battery module cycling study: Classical controller vs SoH-aware MPC")
-    print("=" * 72)
-
-
-def print_configuration(dt_sec, n_cycles, horizon, profile, base_modules, soh_params):
-    print("\n[CONFIG] Simulation settings")
-    print(f"[CONFIG] Time step: {dt_sec:.2f} s")
-    print(f"[CONFIG] Number of cycles: {n_cycles}")
-    print(f"[CONFIG] MPC horizon: {horizon}")
-    print(f"[CONFIG] Steps per cycle: {len(profile)}")
-    print(f"[CONFIG] Total steps per controller: {len(profile) * n_cycles}")
-
-    print("\n[CONFIG] Initial module states")
-    for m in base_modules:
-        print(f"[CONFIG] {m.short_state()} | bounds=({m.soc_min:.2f}, {m.soc_max:.2f}) | Cap={m.capacity_nominal_ah:.1f} Ah")
-
-    print("\n[CONFIG] SoH model coefficients")
-    print(
-        "[CONFIG] "
-        f"x = [{soh_params.x1}, {soh_params.x2}, {soh_params.x3}, {soh_params.x4}, {soh_params.x5}, "
-        f"{soh_params.x6}, {soh_params.x7}, {soh_params.x8}, {soh_params.x9}, {soh_params.x10}]"
-    )
-
-
 def main():
-    plt.ion()
-    plt.rcParams.update({"font.size": 13})
+    print("=" * 80)
+    print("Parallel comparison: classical controller vs original Gurobi MPC")
+    print("=" * 80)
 
-    print_run_header()
-
+    num_tests = 20
+    n_cycles = 10
+    horizon = 5
     dt_sec = 1.0
-    dt_hours = dt_sec / 3600.0
-    n_cycles = 100
-    horizon = 10
+
+    cpu_count = os.cpu_count() or 8
+    max_workers = min(num_tests, max(1, int(0.75 * cpu_count)))
+    solver_threads = 1
 
     soh_params = SoHModelParams(
         x1=0.010,
@@ -92,76 +41,117 @@ def main():
         x10=0.70,
     )
 
-    print("\n[SETUP] Creating battery modules ...")
-    base_modules = create_modules()
+    print("\n[CONFIG]")
+    print(f"Tests:                         {num_tests}")
+    print(f"Cycles per test:               {n_cycles}")
+    print(f"Segments per cycle:            8")
+    print(f"solve_system_v1 calls/test:    {8 * n_cycles}")
+    print(f"MPC horizon:                   {horizon}")
+    print(f"dt:                            {dt_sec} s")
+    print(f"CPU count:                     {cpu_count}")
+    print(f"Parallel workers:              {max_workers}")
+    print(f"Gurobi threads per worker:     {solver_threads}")
+    print(f"Initial SoH range:             random uniform [0.5, 1.0]")
+    print(f"SoH unit:                      [-], not percent")
+    print(f"MPC function:                  original MPCsession_v1 unchanged")
 
-    print("[SETUP] Building pack current profile ...")
-    pack_profile_a = build_pack_current_profile()
+    print("\n[RUN] Starting parallel tests ...")
 
-    print_configuration(dt_sec, n_cycles, horizon, pack_profile_a, base_modules, soh_params)
+    global_start = time.time()
+    seeds = [1000 + i for i in range(num_tests)]
+    results = []
 
-    print("\n[SETUP] Computing initial allocation limits ...")
-    initial_lf = np.array([0.6, 0.3, 0.1], dtype=float)
-    a_list = [m.soc_max - m.soc for m in base_modules]
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                run_single_test,
+                test_id=i + 1,
+                seed=seeds[i],
+                n_cycles=n_cycles,
+                horizon=horizon,
+                dt_sec=dt_sec,
+                soh_params=soh_params,
+                solver_threads=solver_threads,
+                keep_trajectories=False,
+            )
+            for i in range(num_tests)
+        ]
 
-    result = solve_system_v1(
-        a_list=a_list,
-        l1=initial_lf[0],
-        l2=initial_lf[1],
-        l3=initial_lf[2],
-        p=dt_hours,
-        verbose=True,
-    )
+        completed = 0
 
-    T1 = result["T1"]
-    T2 = result["T2"]
-    T3 = result["T3"]
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            completed += 1
 
-    print(f"[SETUP] T1 = {np.round(T1, 3)}")
-    print(f"[SETUP] T2 = {np.round(T2, 3)}")
-    print(f"[SETUP] T3 = {np.round(T3, 3)}")
+            print(
+                f"[RUN] Test {result['test_id']:02d}/{num_tests} finished | "
+                f"seed={result['seed']} | "
+                f"init SoH={np.round(result['init_sohs'], 3)} | "
+                f"classical mean SoH={result['classical_mean_soh']:.6f} | "
+                f"MPC mean SoH={result['mpc_mean_soh']:.6f} | "
+                f"gain={result['mpc_mean_soh'] - result['classical_mean_soh']:.6f} | "
+                f"solve_system calls={result['solve_system_calls']} | "
+                f"time={result['runtime']:.2f}s | "
+                f"progress={completed}/{num_tests}"
+            )
 
-    print("\n[RUN] Launching classical controller simulation ...")
-    classical_modules = np.array([m.clone() for m in base_modules], dtype=object)
+    total_wall_time = time.time() - global_start
 
-    t0 = time.time()
-    classical_modules = run_classical_controller(
-        modules=classical_modules,
-        pack_profile_a=pack_profile_a,
-        dt_hours=dt_hours,
-        n_cycles=n_cycles,
-        soh_params=soh_params,
-        print_every_cycles=5,
-    )
-    classical_time = time.time() - t0
-    print(f"[RUN] Classical controller finished in {classical_time:.2f} s")
+    print("\n[POST] Aggregating results ...")
+    summary = aggregate_results(results)
 
-    print("\n[RUN] Launching MPC controller simulation ...")
-    mpc_modules = np.array([m.clone() for m in base_modules], dtype=object)
+    print("\n[SUMMARY] Average over tests")
+    print("-" * 80)
+    print(f"Number of tests:                    {summary['num_tests']}")
+    print(f"Average classical mean SoH:         {summary['classical_mean_soh_avg']:.6f}")
+    print(f"Average MPC mean SoH:               {summary['mpc_mean_soh_avg']:.6f}")
+    print(f"Average classical minimum SoH:      {summary['classical_min_soh_avg']:.6f}")
+    print(f"Average MPC minimum SoH:            {summary['mpc_min_soh_avg']:.6f}")
+    print(f"Average MPC gain in mean SoH:       {summary['mpc_gain_mean_soh']:.6f}")
+    print(f"Average MPC gain in minimum SoH:    {summary['mpc_gain_min_soh']:.6f}")
+    print(f"Average solve_system calls/test:    {summary['avg_solve_system_calls']:.1f}")
+    print(f"Total solve_system calls:           {summary['total_solve_system_calls']}")
+    print(f"Average runtime per test:           {summary['avg_test_runtime']:.2f} s")
+    print(f"Sum of individual test runtimes:    {summary['sum_test_runtime']:.2f} s")
+    print(f"Total parallel wall-clock runtime:  {total_wall_time:.2f} s")
 
-    t0 = time.time()
-    mpc_modules = run_mpc_controller(
-        modules=mpc_modules,
-        pack_profile_a=pack_profile_a,
-        dt_hours=dt_hours,
+    best = max(results, key=lambda r: r["mpc_mean_soh"] - r["classical_mean_soh"])
+
+    print("\n[SUMMARY] Test with largest MPC mean-SoH advantage")
+    print("-" * 80)
+    print(f"Test ID:                 {best['test_id']}")
+    print(f"Seed:                    {best['seed']}")
+    print(f"Initial SoHs:            {np.round(best['init_sohs'], 6)}")
+    print(f"Classical final SoHs:    {np.round(best['classical_final_soh'], 6)}")
+    print(f"MPC final SoHs:          {np.round(best['mpc_final_soh'], 6)}")
+    print(f"Classical mean SoH:      {best['classical_mean_soh']:.6f}")
+    print(f"MPC mean SoH:            {best['mpc_mean_soh']:.6f}")
+    print(f"MPC mean SoH advantage:  {best['mpc_mean_soh'] - best['classical_mean_soh']:.6f}")
+    print(f"Solve-system calls:      {best['solve_system_calls']}")
+
+    print("\n[POST] Re-running best test with full trajectories for plotting ...")
+
+    best_detailed = run_single_test(
+        test_id=best["test_id"],
+        seed=best["seed"],
         n_cycles=n_cycles,
         horizon=horizon,
-        T1=T1.copy(),
-        T2=T2.copy(),
-        T3=T3.copy(),
+        dt_sec=dt_sec,
         soh_params=soh_params,
-        print_every_cycles=5,
-        print_mpc_inner=False,
+        solver_threads=solver_threads,
+        keep_trajectories=True,
     )
-    mpc_time = time.time() - t0
-    print(f"[RUN] MPC controller finished in {mpc_time:.2f} s")
 
-    print("\n[POST] Preparing summary and plots ...")
-    summarize_results(classical_modules, mpc_modules)
-    plot_comparison(classical_modules, mpc_modules, dt_hours)
+    plot_best_test_trajectories(
+        classical_modules=best_detailed["classical_modules"],
+        mpc_modules=best_detailed["mpc_modules"],
+        dt_sec=dt_sec,
+        save_path="best_test_soc_soh.png",
+    )
 
-    print("\n[DONE] All tasks completed.")
-    plt.ioff()
+    print("\n[DONE] Finished.")
+    print("[DONE] Best-test plot saved as: best_test_soc_soh.png")
 
 
 if __name__ == "__main__":

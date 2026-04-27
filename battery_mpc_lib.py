@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import copy
+import time
+from dataclasses import dataclass, field
+
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 import matplotlib.pyplot as plt
-from dataclasses import dataclass, field
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
 
 
 @dataclass
@@ -24,315 +24,319 @@ class SoHModelParams:
     x9: float = 0.400
     x10: float = 0.70
 
-    def as_array(self) -> np.ndarray:
+    def as_array(self):
         return np.array(
-            [self.x1, self.x2, self.x3, self.x4, self.x5,
-             self.x6, self.x7, self.x8, self.x9, self.x10],
-            dtype=float
+            [
+                self.x1, self.x2, self.x3, self.x4, self.x5,
+                self.x6, self.x7, self.x8, self.x9, self.x10
+            ],
+            dtype=float,
         )
 
 
 @dataclass
-class Module:
-    soc: float
-    soh: float
-    imax: float
-    soc_min: float
-    soc_max: float
-    capacity_nominal_ah: float
-    module_id: str = "M0"
+class module:
+    SoC: float
+    SoH: float          # SoH is now in [0, 1]
+    Imax: float
+    xmin: float
+    xmax: float
+    idP: str = "M0"
+    capacity_nominal_ah: float = 50.0
+
+    LF: np.ndarray = field(default_factory=lambda: np.array([]))
+    Traj: np.ndarray = field(default_factory=lambda: np.array([]))
+    SoHTraj: np.ndarray = field(default_factory=lambda: np.array([]))
+    FCETraj: np.ndarray = field(default_factory=lambda: np.array([]))
 
     throughput_ah: float = 0.0
-    fce: float = 0.0
-    current_a_hist: list = field(default_factory=list)
-    soc_hist: list = field(default_factory=list)
-    soh_hist: list = field(default_factory=list)
-    fce_hist: list = field(default_factory=list)
-    lf_hist: list = field(default_factory=list)
-    pack_cycle_start_soc: float = None
-    last_current_sign: int = 0
+    FCE: float = 0.0
+    current_direction: int = 0
+    soc_cycle_start: float = None
 
     def __post_init__(self):
-        self.soc0 = self.soc
-        self.soh0 = self.soh
-        self.pack_cycle_start_soc = self.soc
-        self.soc_hist = [self.soc]
-        self.soh_hist = [self.soh]
-        self.fce_hist = [self.fce]
+        self.id = self.idP
+        self.SoC0 = self.SoC
+
+        self.SoH = max(0.0, min(1.0, self.SoH))
+        self.SoH0 = self.SoH
+
+        self.SoCmin = self.xmin
+        self.SoCmax = self.xmax
+
+        self.Traj = np.array([self.SoC])
+        self.SoHTraj = np.array([self.SoH])
+        self.FCETraj = np.array([self.FCE])
+
+        self.soc_cycle_start = self.SoC
 
     def reset(self):
-        self.soc = self.soc0
-        self.soh = self.soh0
+        self.SoC = self.SoC0
+        self.SoH = self.SoH0
+        self.LF = np.array([])
+        self.Traj = np.array([self.SoC])
+        self.SoHTraj = np.array([self.SoH])
+        self.FCETraj = np.array([0.0])
         self.throughput_ah = 0.0
-        self.fce = 0.0
-        self.current_a_hist = []
-        self.soc_hist = [self.soc]
-        self.soh_hist = [self.soh]
-        self.fce_hist = [self.fce]
-        self.lf_hist = []
-        self.pack_cycle_start_soc = self.soc
-        self.last_current_sign = 0
+        self.FCE = 0.0
+        self.current_direction = 0
+        self.soc_cycle_start = self.SoC
 
     def clone(self):
         return copy.deepcopy(self)
 
-    def short_state(self) -> str:
-        return f"{self.module_id}(SoC={self.soc:.3f}, SoH={self.soh:.3f}, FCE={self.fce:.3f})"
+    def short_state(self):
+        return f"{self.id}: SoC={self.SoC:.3f}, SoH={self.SoH:.3f}, FCE={self.FCE:.4f}"
 
 
 def get_switching_matrices():
     J = 6
-    sm = np.empty(J, dtype=object)
-    sm[0] = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-    sm[1] = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]])
-    sm[2] = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
-    sm[3] = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]])
-    sm[4] = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]])
-    sm[5] = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]])
-    return sm
+    SM = np.empty(J, dtype=object)
+
+    SM[0] = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    SM[1] = np.array([[0, 1, 0], [1, 0, 0], [0, 0, 1]])
+    SM[2] = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
+    SM[3] = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]])
+    SM[4] = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]])
+    SM[5] = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]])
+
+    return SM
 
 
-def sort_modules(modules, by_soc=True):
-    modules_sorted = modules.copy()
-    n = len(modules_sorted)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if by_soc:
-                if modules_sorted[i].soc > modules_sorted[j].soc:
-                    modules_sorted[i], modules_sorted[j] = modules_sorted[j], modules_sorted[i]
-            else:
-                if modules_sorted[i].soh < modules_sorted[j].soh:
-                    modules_sorted[i], modules_sorted[j] = modules_sorted[j], modules_sorted[i]
-    return modules_sorted
+def SortLoad(BatteryModules, mode="charge"):
+    """
+    Classical SoC-balancing sorting.
+
+    charge:
+        lowest SoC gets highest positive current
+
+    discharge:
+        highest SoC gets highest negative current magnitude
+
+    soh:
+        highest SoH first
+    """
+    BatteryModules = BatteryModules.copy()
+
+    if mode == "charge":
+        BatteryModules = sorted(BatteryModules, key=lambda b: b.SoC)
+
+    elif mode == "discharge":
+        BatteryModules = sorted(BatteryModules, key=lambda b: b.SoC, reverse=True)
+
+    elif mode == "soh":
+        BatteryModules = sorted(BatteryModules, key=lambda b: b.SoH, reverse=True)
+
+    else:
+        raise ValueError("mode must be 'charge', 'discharge', or 'soh'")
+
+    return np.array(BatteryModules, dtype=object)
 
 
-def stress_factor(current_a, dod_pct, soc_avg_pct, params: SoHModelParams):
+def stress_factor(current, dod, soc_avg, params):
     x = params.as_array()
-    c = abs(current_a)
+    C = abs(current)
 
-    term1 = x[0] * np.exp(x[1] * c) + x[2]
-    term2 = x[3] * np.exp(x[4] * dod_pct) + x[5]
-    term3 = x[6] * np.exp(x[7] * soc_avg_pct) + x[8]
-
-    return abs(term1 * term2 * term3)
-
-
-def fce_offset_from_soh(soh_pct, stress, params: SoHModelParams):
-    x10 = params.x10
-    eps = 1e-12
-    stress = max(stress, eps)
-    remaining = max(100.0 - soh_pct, 0.0)
-    return (remaining / stress) ** (1.0 / x10)
+    return abs(
+        (x[0] * np.exp(x[1] * C) + x[2])
+        * (x[3] * np.exp(x[4] * dod) + x[5])
+        * (x[6] * np.exp(x[7] * soc_avg) + x[8])
+    )
 
 
-def soh_from_stress_and_fce(stress, fce_total, fce_offset, params: SoHModelParams):
-    x10 = params.x10
-    soh = 100.0 - abs(stress * ((fce_total + fce_offset) ** x10))
-    return max(0.0, min(100.0, soh))
+def update_soh_module(battery, current, dt_hours, soh_params):
+    """
+    Battery.SoH is stored in [0, 1].
+
+    The empirical degradation equation is evaluated internally in percent,
+    because the original formula uses 100 - SoH.
+    """
+    prev_soc = battery.SoC
+    direction = 0 if abs(current) < 1e-12 else int(np.sign(current))
+
+    if battery.current_direction == 0 and direction != 0:
+        battery.current_direction = direction
+        battery.soc_cycle_start = prev_soc
+
+    elif direction != 0 and direction != battery.current_direction:
+        battery.soc_cycle_start = prev_soc
+        battery.current_direction = direction
+
+    delta_ah = current * dt_hours
+    battery.throughput_ah += abs(delta_ah)
+    battery.FCE = battery.throughput_ah / (2.0 * battery.capacity_nominal_ah)
+
+    battery.SoC = battery.SoC + delta_ah / battery.capacity_nominal_ah
+    battery.SoC = min(battery.SoCmax, max(battery.SoCmin, battery.SoC))
+
+    soc0 = battery.soc_cycle_start
+    soc = battery.SoC
+
+    soc_avg = ((abs(soc - soc0) / 2.0) + min(soc, soc0)) * 100.0
+    dod = abs(soc - soc0) * 100.0
+
+    stress = stress_factor(current, dod, soc_avg, soh_params)
+    stress = max(stress, 1e-12)
+
+    x10 = soh_params.x10
+
+    soh_percent = battery.SoH * 100.0
+    fce0 = ((100.0 - soh_percent) / stress) ** (1.0 / x10)
+
+    soh_percent_new = 100.0 - abs(stress * ((battery.FCE + fce0) ** x10))
+    soh_percent_new = max(0.0, min(100.0, soh_percent_new))
+
+    battery.SoH = soh_percent_new / 100.0
+
+    battery.Traj = np.append(battery.Traj, battery.SoC)
+    battery.SoHTraj = np.append(battery.SoHTraj, battery.SoH)
+    battery.FCETraj = np.append(battery.FCETraj, battery.FCE)
 
 
-def compute_dod_and_socavg(soc_start, soc_now):
-    soc_avg = ((abs(soc_now - soc_start) / 2.0) + min(soc_now, soc_start)) * 100.0
-    dod = abs(soc_now - soc_start) * 100.0
-    return dod, soc_avg
+def MPCsession_v1(BatteryModules, dt, LF, N, T1, T2, T3, solver_threads=1, verbose=False):
+    """
+    Original MPC function kept unchanged in structure.
+    """
+    J = 6
+    n_states = len(BatteryModules)
+    n_controls = n_states
 
+    x_traj = np.zeros((N + 1, n_states))
+    u_traj = np.zeros((N, n_controls))
+    delta_traj = np.zeros((N, J))
+    x_traj[0, :] = [battery.SoC for battery in BatteryModules]
 
-def update_module_state_and_soh(module: Module, current_a, dt_hours, soh_params: SoHModelParams):
-    prev_soc = module.soc
-    sign_now = 0 if abs(current_a) < 1e-12 else int(np.sign(current_a))
-
-    if module.last_current_sign == 0:
-        module.last_current_sign = sign_now
-        module.pack_cycle_start_soc = prev_soc
-    elif sign_now != 0 and sign_now != module.last_current_sign:
-        module.pack_cycle_start_soc = prev_soc
-        module.last_current_sign = sign_now
-
-    delta_ah = current_a * dt_hours
-    module.throughput_ah += abs(delta_ah)
-    module.fce = module.throughput_ah / (2.0 * module.capacity_nominal_ah)
-
-    new_soc = prev_soc + delta_ah / module.capacity_nominal_ah
-    new_soc = min(module.soc_max, max(module.soc_min, new_soc))
-    module.soc = new_soc
-
-    dod_pct, soc_avg_pct = compute_dod_and_socavg(module.pack_cycle_start_soc, module.soc)
-    stress = stress_factor(current_a, dod_pct, soc_avg_pct, soh_params)
-    fce_offset = fce_offset_from_soh(module.soh, stress, soh_params)
-    module.soh = soh_from_stress_and_fce(stress, module.fce, fce_offset, soh_params)
-
-    module.current_a_hist.append(current_a)
-    module.soc_hist.append(module.soc)
-    module.soh_hist.append(module.soh)
-    module.fce_hist.append(module.fce)
-
-
-def build_pack_current_profile():
-    segments = [
-        (+15.0, 10 * 60),
-        (+30.0, 10 * 60),
-        (+40.0, 10 * 60),
-        (0.0,   3 * 60),
-        (-20.0, 10 * 60),
-        (-35.0, 10 * 60),
-        (-45.0, 10 * 60),
-        (0.0,   3 * 60),
-    ]
-
-    profile = []
-    for current, duration_sec in segments:
-        profile.extend([current] * duration_sec)
-    return np.array(profile, dtype=float)
-
-
-def classical_load_factors(pack_current_a):
-    if abs(pack_current_a) < 1e-12:
-        return np.array([0.0, 0.0, 0.0])
-    return np.array([0.6, 0.3, 0.1], dtype=float)
-
-
-def permutation_cost_for_step(modules, shares, pack_current_a, dt_hours, soh_params: SoHModelParams):
-    cost = 0.0
-    for m, share in zip(modules, shares):
-        module_current = share * pack_current_a
-        soc_pred = m.soc + (module_current * dt_hours / m.capacity_nominal_ah)
-        soc_pred = min(m.soc_max, max(m.soc_min, soc_pred))
-
-        dod_pct, soc_avg_pct = compute_dod_and_socavg(m.pack_cycle_start_soc, soc_pred)
-        stress = stress_factor(module_current, dod_pct, soc_avg_pct, soh_params)
-        weak_penalty = 1.0 / max(m.soh, 1e-6)
-
-        soc_margin_penalty = 0.0
-        if soc_pred < m.soc_min + 0.02:
-            soc_margin_penalty += 50.0 * (m.soc_min + 0.02 - soc_pred)
-        if soc_pred > m.soc_max - 0.02:
-            soc_margin_penalty += 50.0 * (soc_pred - (m.soc_max - 0.02))
-
-        cost += weak_penalty * stress + soc_margin_penalty
-
-    return cost
-
-
-def choose_best_permutation_step(modules, pack_current_a, dt_hours, soh_params: SoHModelParams):
-    sm = get_switching_matrices()
-    base_shares = classical_load_factors(pack_current_a)
-
-    if np.allclose(base_shares, 0.0):
-        return np.zeros(3), np.zeros(6)
-
-    best_idx = None
-    best_shares = None
-    best_cost = np.inf
-
-    for j in range(6):
-        shares = sm[j] @ base_shares
-        cost = permutation_cost_for_step(modules, shares, pack_current_a, dt_hours, soh_params)
-        if cost < best_cost:
-            best_cost = cost
-            best_idx = j
-            best_shares = shares
-
-    delta = np.zeros(6)
-    delta[best_idx] = 1.0
-    return best_shares, delta
-
-
-def mpc_session_v1(modules, dt_hours, pack_current_horizon, T1, T2, T3, soh_params: SoHModelParams, verbose=False):
-    n_states = len(modules)
-    n_horizon = len(pack_current_horizon)
-    j_count = 6
-    sm = get_switching_matrices()
-
-    if verbose:
-        print(f"    [MPC] Building optimization problem for horizon {n_horizon} ...")
-
-    model = gp.Model("soh_aware_mpc")
+    model = gp.Model()
     model.Params.OutputFlag = 0
-    model.Params.Threads = max(1, os.cpu_count() or 1)
+    model.Params.Threads = solver_threads
 
-    delta = model.addVars(n_horizon, j_count, vtype=GRB.BINARY, name="delta")
-    x = model.addVars(n_horizon + 1, n_states, lb=-GRB.INFINITY, ub=GRB.INFINITY, name="x")
+    u_vars = model.addVars(range(N), n_controls, lb=-GRB.INFINITY, ub=GRB.INFINITY, name="u")
+    x_vars = model.addVars(range(N + 1), n_states, lb=-GRB.INFINITY, ub=GRB.INFINITY, name="x")
+    delta_vars = model.addVars(range(N), J, vtype=GRB.BINARY, name="delta")
 
-    for i in range(n_states):
-        model.addConstr(x[0, i] == modules[i].soc)
+    SM = get_switching_matrices()
 
-    objective_terms = []
-    base_shares_cache = []
+    R = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    Q = [[1e0, 0, 0], [0, 1e0, 0], [0, 0, 1e0]]
 
-    for k in range(n_horizon):
-        pack_current = pack_current_horizon[k]
-        base_shares = classical_load_factors(pack_current)
-        base_shares_cache.append(base_shares)
-
-        model.addConstr(gp.quicksum(delta[k, j] for j in range(j_count)) == 1)
-
-        step_costs = []
-        for j in range(j_count):
-            shares = sm[j] @ base_shares
-            step_costs.append(
-                permutation_cost_for_step(modules, shares, pack_current, dt_hours, soh_params)
-            )
-
-        for i in range(n_states):
-            next_soc_expr = x[k, i] + (dt_hours * pack_current / modules[i].capacity_nominal_ah) * gp.quicksum(
-                delta[k, j] * (sm[j] @ base_shares)[i] for j in range(j_count)
-            )
-
-            model.addConstr(x[k + 1, i] == next_soc_expr)
-            model.addConstr(x[k + 1, i] <= modules[i].soc_max)
-            model.addConstr(x[k + 1, i] >= modules[i].soc_min)
-
-        objective_terms.append(
-            gp.quicksum(delta[k, j] * step_costs[j] for j in range(j_count))
+    objective = gp.quicksum(
+        (
+            (u_vars[k, i] - BatteryModules[i].SoH) * Q[i][l] * (u_vars[k, l] - BatteryModules[i].SoH)
+            + (u_vars[k, i] * R[i][l] * u_vars[k, l])
         )
+        for i in range(n_states)
+        for l in range(n_states)
+        for k in range(N)
+    )
 
-    model.addConstr(gp.quicksum(delta[k, 0] + delta[k, 3] for k in range(n_horizon)) <= T1[0])
-    model.addConstr(gp.quicksum(delta[k, 1] + delta[k, 2] for k in range(n_horizon)) <= T1[1])
-    model.addConstr(gp.quicksum(delta[k, 4] + delta[k, 5] for k in range(n_horizon)) <= T1[2])
+    model.addConstrs(
+        (x_vars[k, i] <= BatteryModules[i].SoCmax for i in range(n_controls) for k in range(N)),
+        name="soc_upper",
+    )
 
-    model.addConstr(gp.quicksum(delta[k, 1] + delta[k, 4] for k in range(n_horizon)) <= T2[0])
-    model.addConstr(gp.quicksum(delta[k, 0] + delta[k, 5] for k in range(n_horizon)) <= T2[1])
-    model.addConstr(gp.quicksum(delta[k, 2] + delta[k, 3] for k in range(n_horizon)) <= T2[2])
+    model.addConstrs(
+        (BatteryModules[i].SoCmin <= x_vars[k, i] for i in range(n_controls) for k in range(N)),
+        name="soc_lower",
+    )
 
-    model.addConstr(gp.quicksum(delta[k, 2] + delta[k, 5] for k in range(n_horizon)) <= T3[0])
-    model.addConstr(gp.quicksum(delta[k, 3] + delta[k, 4] for k in range(n_horizon)) <= T3[1])
-    model.addConstr(gp.quicksum(delta[k, 0] + delta[k, 1] for k in range(n_horizon)) <= T3[2])
+    model.addConstrs(
+        (
+            x_vars[k + 1, j] == x_vars[k, j] + dt * u_vars[k, j]
+            for j in range(n_states)
+            for k in range(N)
+        ),
+        name="dynamics",
+    )
 
-    model.setObjective(gp.quicksum(objective_terms), GRB.MINIMIZE)
+    model.addConstrs(
+        (
+            u_vars[k, j] == gp.quicksum(delta_vars[k, i] * np.dot(SM[i][j], LF) for i in range(J))
+            for j in range(n_states)
+            for k in range(N)
+        ),
+        name="control_form",
+    )
 
-    if verbose:
-        print("    [MPC] Solving ...")
+    model.addConstrs(
+        (x_vars[0, i] == x_traj[0, i] for i in range(n_states)),
+        name="initial_state",
+    )
 
+    model.addConstrs(
+        (gp.quicksum(delta_vars[k, i] for i in range(J)) == 1 for k in range(N)),
+        name="delta_sum",
+    )
+
+    model.addConstr(gp.quicksum(delta_vars[k, 0] + delta_vars[k, 3] for k in range(N)) <= T1[0])
+    model.addConstr(gp.quicksum(delta_vars[k, 1] + delta_vars[k, 2] for k in range(N)) <= T1[1])
+    model.addConstr(gp.quicksum(delta_vars[k, 4] + delta_vars[k, 5] for k in range(N)) <= T1[2])
+
+    model.addConstr(gp.quicksum(delta_vars[k, 1] + delta_vars[k, 4] for k in range(N)) <= T2[0])
+    model.addConstr(gp.quicksum(delta_vars[k, 0] + delta_vars[k, 5] for k in range(N)) <= T2[1])
+    model.addConstr(gp.quicksum(delta_vars[k, 2] + delta_vars[k, 3] for k in range(N)) <= T2[2])
+
+    model.addConstr(gp.quicksum(delta_vars[k, 2] + delta_vars[k, 5] for k in range(N)) <= T3[0])
+    model.addConstr(gp.quicksum(delta_vars[k, 3] + delta_vars[k, 4] for k in range(N)) <= T3[1])
+    model.addConstr(gp.quicksum(delta_vars[k, 0] + delta_vars[k, 1] for k in range(N)) <= T3[2])
+
+    model.setObjective(objective, GRB.MINIMIZE)
     model.optimize()
 
-    if model.status != GRB.OPTIMAL:
+    if model.status == GRB.OPTIMAL:
         if verbose:
-            print("    [MPC] Solver did not return OPTIMAL. Falling back to greedy step.")
-        shares, delta_now = choose_best_permutation_step(modules, pack_current_horizon[0], dt_hours, soh_params)
-        x_traj = np.zeros((n_horizon + 1, n_states))
-        u_traj = np.zeros((n_horizon, n_states))
-        delta_traj = np.zeros((n_horizon, j_count))
-        x_traj[0, :] = [m.soc for m in modules]
-        u_traj[0, :] = shares * pack_current_horizon[0]
-        delta_traj[0, :] = delta_now
-        return x_traj, u_traj, delta_traj
+            print("model feasible")
 
-    if verbose:
-        print("    [MPC] Solve finished successfully.")
+        x_traj = np.array([[x_vars[i, j].X for j in range(n_states)] for i in range(N + 1)])
+        u_traj = np.array([[u_vars[i, j].X for j in range(n_states)] for i in range(N)])
+        delta_traj = np.array([[delta_vars[i, j].X for j in range(J)] for i in range(N)])
 
-    x_traj = np.array([[x[k, i].X for i in range(n_states)] for k in range(n_horizon + 1)])
-    delta_traj = np.array([[delta[k, j].X for j in range(j_count)] for k in range(n_horizon)])
-
-    u_traj = np.zeros((n_horizon, n_states))
-    for k in range(n_horizon):
-        selected_j = int(np.argmax(delta_traj[k, :]))
-        shares = sm[selected_j] @ base_shares_cache[k]
-        u_traj[k, :] = shares * pack_current_horizon[k]
+    elif model.status == GRB.INFEASIBLE:
+        if verbose:
+            print("model infeasible")
 
     return x_traj, u_traj, delta_traj
 
 
-def update_limits(T1, T2, T3, delta_traj):
+def solve_system_v1(a_list, l1, l2, l3, P, solver_threads=1, verbose=False):
+    N = len(a_list)
+
+    model = gp.Model("equation_system")
+    model.Params.OutputFlag = 0
+    model.Params.Threads = solver_threads
+
+    T1 = model.addVars(N, name="T1", lb=0)
+    T2 = model.addVars(N, name="T2", lb=0)
+    T3 = model.addVars(N, name="T3", lb=0)
+
+    for i in range(N):
+        model.addConstr(a_list[i] == T1[i] * l1 * P + T2[i] * l2 * P + T3[i] * l3 * P)
+
+    sum_T1 = gp.quicksum(T1[i] for i in range(N))
+    sum_T2 = gp.quicksum(T2[i] for i in range(N))
+    sum_T3 = gp.quicksum(T3[i] for i in range(N))
+
+    model.addConstr(sum_T1 == sum_T2)
+    model.addConstr(sum_T1 == sum_T3)
+
+    model.addConstr(T1[0] + T2[0] + T3[0] == T1[1] + T2[1] + T3[1])
+    model.addConstr(T1[0] + T2[0] + T3[0] == T1[2] + T2[2] + T3[2])
+
+    objective = 60 * T1[0] + 40 * T2[1] + 20 * T3[2] + 5 * T2[0] + 3 * T3[1] + 1 * T2[2]
+    model.setObjective(objective, GRB.MAXIMIZE)
+    model.optimize()
+
+    if model.status == GRB.OPTIMAL:
+        return {
+            "T1": [T1[i].X for i in range(N)],
+            "T2": [T2[i].X for i in range(N)],
+            "T3": [T3[i].X for i in range(N)],
+            "ObjectiveValue": model.ObjVal,
+        }
+
+    raise RuntimeError(f"solve_system_v1 failed. Gurobi status: {model.status}")
+
+
+def UpdateLimits(T1, T2, T3, delta_traj):
     delta_step = delta_traj[0, :]
 
     if delta_step[0] >= 1:
@@ -363,196 +367,254 @@ def update_limits(T1, T2, T3, delta_traj):
     return T1, T2, T3
 
 
-def solve_system_v1(a_list, l1, l2, l3, p, verbose=True):
-    n = len(a_list)
-
-    if verbose:
-        print("[INIT] Solving initial allocation problem for T1, T2, T3 ...")
-
-    model = gp.Model("equation_system")
-    model.Params.OutputFlag = 0
-    model.Params.Threads = max(1, os.cpu_count() or 1)
-
-    T1 = model.addVars(n, name="T1", lb=0)
-    T2 = model.addVars(n, name="T2", lb=0)
-    T3 = model.addVars(n, name="T3", lb=0)
-
-    for i in range(n):
-        model.addConstr(a_list[i] == T1[i] * l1 * p + T2[i] * l2 * p + T3[i] * l3 * p)
-
-    sum_T1 = gp.quicksum(T1[i] for i in range(n))
-    sum_T2 = gp.quicksum(T2[i] for i in range(n))
-    sum_T3 = gp.quicksum(T3[i] for i in range(n))
-
-    model.addConstr(sum_T1 == sum_T2)
-    model.addConstr(sum_T1 == sum_T3)
-
-    model.addConstr(T1[0] + T2[0] + T3[0] == T1[1] + T2[1] + T3[1])
-    model.addConstr(T1[0] + T2[0] + T3[0] == T1[2] + T2[2] + T3[2])
-
-    objective = 60 * T1[0] + 40 * T2[1] + 20 * T3[2] + 5 * T2[0] + 3 * T3[1] + 1 * T2[2]
-    model.setObjective(objective, GRB.MAXIMIZE)
-    model.optimize()
-
-    if model.status == GRB.OPTIMAL:
-        result = {
-            "T1": [T1[i].X for i in range(n)],
-            "T2": [T2[i].X for i in range(n)],
-            "T3": [T3[i].X for i in range(n)],
-            "ObjectiveValue": model.ObjVal,
-        }
-        if verbose:
-            print("[INIT] Initial allocation solved.")
-            print(f"[INIT] Objective value: {result['ObjectiveValue']:.4f}")
-        return result
-
-    if verbose:
-        print(f"[INIT] Initial allocation failed with status {model.status}.")
-    return {"status": model.status}
+def build_pack_current_segments():
+    return [
+        (+15.0, 3 * 60),
+        (+30.0, 3 * 60),
+        (+40.0, 3 * 60),
+        (0.0, 1 * 60),
+        (-20.0, 3 * 60),
+        (-35.0, 3 * 60),
+        (-45.0, 3 * 60),
+        (0.0, 1 * 60),
+    ]
 
 
-def apply_currents_to_modules(modules, module_currents_a, dt_hours, soh_params):
-    for m, current_a in zip(modules, module_currents_a):
-        update_module_state_and_soh(m, current_a, dt_hours, soh_params)
+def create_random_battery_modules(seed=None):
+    rng = np.random.default_rng(seed)
+    sohs = rng.uniform(0.5, 1.0, size=3)
+
+    BatteryModules = np.empty(3, dtype=object)
+    BatteryModules[0] = module(0.4, float(sohs[0]), 50.0, 0.2, 0.9, "M1", 50.0)
+    BatteryModules[1] = module(0.5, float(sohs[1]), 50.0, 0.2, 0.8, "M2", 50.0)
+    BatteryModules[2] = module(0.3, float(sohs[2]), 50.0, 0.2, 0.6, "M3", 50.0)
+
+    return BatteryModules
 
 
-def run_classical_controller(modules, pack_profile_a, dt_hours, n_cycles, soh_params, print_every_cycles=5):
-    cycle_len = len(pack_profile_a)
-    total_steps = n_cycles * cycle_len
+def run_classical_controller(BatteryModules, dt_hours, n_cycles, soh_params):
+    LF_base = np.array([0.6, 0.3, 0.1])
+    segments = build_pack_current_segments()
 
-    print("\n[CLASSICAL] Starting simulation ...")
-    print(f"[CLASSICAL] Target cycles: {n_cycles}")
-    print(f"[CLASSICAL] Steps per cycle: {cycle_len}")
-    print(f"[CLASSICAL] Total simulation steps: {total_steps}")
+    for _ in range(n_cycles):
+        for pack_current, duration_steps in segments:
+            for _ in range(duration_steps):
 
-    last_reported_cycle = -1
+                if pack_current > 0:
+                    BatteryModules = SortLoad(BatteryModules, mode="charge")
+                elif pack_current < 0:
+                    BatteryModules = SortLoad(BatteryModules, mode="discharge")
 
-    for step in range(total_steps):
-        pack_current = pack_profile_a[step % cycle_len]
-        shares = classical_load_factors(pack_current)
-        module_currents = shares * pack_current
+                currents = LF_base * pack_current
 
-        if abs(pack_current) > 1e-12:
-            modules = sort_modules(modules, by_soc=(pack_current > 0))
+                for battery, current in zip(BatteryModules, currents):
+                    battery.LF = np.append(battery.LF, current)
+                    update_soh_module(battery, current, dt_hours, soh_params)
 
-        apply_currents_to_modules(modules, module_currents, dt_hours, soh_params)
-
-        for m, lf in zip(modules, shares):
-            m.lf_hist.append(lf)
-
-        current_cycle = (step + 1) // cycle_len
-        if current_cycle > last_reported_cycle and current_cycle % print_every_cycles == 0 and (step + 1) % cycle_len == 0:
-            avg_soh = np.mean([m.soh for m in modules])
-            min_soh = np.min([m.soh for m in modules])
-            print(f"[CLASSICAL] Completed cycle {current_cycle}/{n_cycles} | avg SoH={avg_soh:.3f} | min SoH={min_soh:.3f}")
-            last_reported_cycle = current_cycle
-
-    print("[CLASSICAL] Simulation finished.")
-    return modules
+    return BatteryModules
 
 
-def run_mpc_controller(modules, pack_profile_a, dt_hours, n_cycles, horizon, T1, T2, T3, soh_params,
-                       print_every_cycles=5, print_mpc_inner=False):
-    cycle_len = len(pack_profile_a)
-    total_steps = n_cycles * cycle_len
+def run_mpc_controller(
+    BatteryModules,
+    dt_hours,
+    n_cycles,
+    horizon,
+    soh_params,
+    solver_threads=1,
+    verbose_segments=False,
+):
+    LF_base = np.array([0.6, 0.3, 0.1])
+    LF_base = np.sort(LF_base)[::-1]
 
-    print("\n[MPC] Starting simulation ...")
-    print(f"[MPC] Target cycles: {n_cycles}")
-    print(f"[MPC] Steps per cycle: {cycle_len}")
-    print(f"[MPC] Total simulation steps: {total_steps}")
-    print(f"[MPC] Prediction horizon: {horizon}")
+    segments = build_pack_current_segments()
+    capacity_ah = BatteryModules[0].capacity_nominal_ah
+    dt_soc_per_amp = dt_hours / capacity_ah
 
-    last_reported_cycle = -1
+    solve_system_calls = 0
 
-    for step in range(total_steps):
-        idx0 = step % cycle_len
-        horizon_currents = np.array(
-            [pack_profile_a[(idx0 + k) % cycle_len] for k in range(horizon)],
-            dtype=float
-        )
+    for cycle in range(n_cycles):
+        for segment_id, (pack_current, duration_steps) in enumerate(segments):
+            solve_system_calls += 1
 
-        verbose_now = print_mpc_inner and (step % max(1, cycle_len // 8) == 0)
+            if verbose_segments:
+                print(
+                    f"[MPC] Cycle {cycle + 1}/{n_cycles}, "
+                    f"segment {segment_id + 1}/8, "
+                    f"Ipack={pack_current:.1f} A"
+                )
 
-        x_traj, u_traj, delta_traj = mpc_session_v1(
-            modules=modules,
-            dt_hours=dt_hours,
-            pack_current_horizon=horizon_currents,
-            T1=T1,
-            T2=T2,
-            T3=T3,
-            soh_params=soh_params,
-            verbose=verbose_now,
-        )
+            if pack_current > 0:
+                AList = [b.SoCmax - b.SoC for b in BatteryModules]
+                P_segment = abs(pack_current) * dt_soc_per_amp
 
-        T1, T2, T3 = update_limits(T1, T2, T3, delta_traj)
+            elif pack_current < 0:
+                AList = [b.SoC - b.SoCmin for b in BatteryModules]
+                P_segment = abs(pack_current) * dt_soc_per_amp
 
-        module_currents = u_traj[0, :]
-        pack_current = pack_profile_a[idx0]
-        shares = np.zeros_like(module_currents) if abs(pack_current) < 1e-12 else module_currents / pack_current
+            else:
+                AList = [0.0, 0.0, 0.0]
+                P_segment = 1.0
 
-        apply_currents_to_modules(modules, module_currents, dt_hours, soh_params)
+            result = solve_system_v1(
+                AList,
+                LF_base[0],
+                LF_base[1],
+                LF_base[2],
+                P_segment,
+                solver_threads=solver_threads,
+                verbose=False,
+            )
 
-        for m, lf in zip(modules, shares):
-            m.lf_hist.append(lf)
+            T1 = result["T1"]
+            T2 = result["T2"]
+            T3 = result["T3"]
 
-        current_cycle = (step + 1) // cycle_len
-        if current_cycle > last_reported_cycle and current_cycle % print_every_cycles == 0 and (step + 1) % cycle_len == 0:
-            avg_soh = np.mean([m.soh for m in modules])
-            min_soh = np.min([m.soh for m in modules])
-            print(f"[MPC] Completed cycle {current_cycle}/{n_cycles} | avg SoH={avg_soh:.3f} | min SoH={min_soh:.3f}")
-            last_reported_cycle = current_cycle
+            for _ in range(duration_steps):
+                if abs(pack_current) < 1e-12:
+                    u = np.zeros(3)
+                    delta_traj = np.zeros((horizon, 6))
+                else:
+                    LF = LF_base * pack_current
 
-    print("[MPC] Simulation finished.")
-    return modules
+                    _, u_traj, delta_traj = MPCsession_v1(
+                        BatteryModules,
+                        dt_soc_per_amp,
+                        LF,
+                        horizon,
+                        T1,
+                        T2,
+                        T3,
+                        solver_threads=solver_threads,
+                        verbose=False,
+                    )
+
+                    T1, T2, T3 = UpdateLimits(T1, T2, T3, delta_traj)
+                    u = u_traj[0, :]
+
+                for battery, current in zip(BatteryModules, u):
+                    battery.LF = np.append(battery.LF, current)
+                    update_soh_module(battery, current, dt_hours, soh_params)
+
+    return BatteryModules, solve_system_calls
 
 
-def plot_comparison(classical_modules, mpc_modules, dt_hours):
-    print("\n[PLOT] Generating comparison plots ...")
+def run_single_test(
+    test_id,
+    seed,
+    n_cycles,
+    horizon,
+    dt_sec,
+    soh_params,
+    solver_threads=1,
+    keep_trajectories=False,
+):
+    dt_hours = dt_sec / 3600.0
 
-    t_classical = np.arange(len(classical_modules[0].soc_hist)) * dt_hours
-    t_mpc = np.arange(len(mpc_modules[0].soc_hist)) * dt_hours
+    base_modules = create_random_battery_modules(seed)
+    init_sohs = np.array([b.SoH for b in base_modules], dtype=float)
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 14), sharex=False)
+    classical_modules = np.array([b.clone() for b in base_modules], dtype=object)
+    mpc_modules = np.array([b.clone() for b in base_modules], dtype=object)
 
+    start = time.time()
+
+    classical_modules = run_classical_controller(
+        classical_modules,
+        dt_hours,
+        n_cycles,
+        soh_params,
+    )
+
+    mpc_modules, solve_system_calls = run_mpc_controller(
+        mpc_modules,
+        dt_hours,
+        n_cycles,
+        horizon,
+        soh_params,
+        solver_threads=solver_threads,
+        verbose_segments=False,
+    )
+
+    elapsed = time.time() - start
+
+    classical_final_soh = np.array([b.SoH for b in classical_modules], dtype=float)
+    mpc_final_soh = np.array([b.SoH for b in mpc_modules], dtype=float)
+
+    result = {
+        "test_id": test_id,
+        "seed": seed,
+        "init_sohs": init_sohs,
+        "classical_final_soh": classical_final_soh,
+        "mpc_final_soh": mpc_final_soh,
+        "classical_mean_soh": float(np.mean(classical_final_soh)),
+        "mpc_mean_soh": float(np.mean(mpc_final_soh)),
+        "classical_min_soh": float(np.min(classical_final_soh)),
+        "mpc_min_soh": float(np.min(mpc_final_soh)),
+        "solve_system_calls": solve_system_calls,
+        "runtime": elapsed,
+    }
+
+    if keep_trajectories:
+        result["classical_modules"] = classical_modules
+        result["mpc_modules"] = mpc_modules
+
+    return result
+
+
+def aggregate_results(results):
+    classical_mean = np.array([r["classical_mean_soh"] for r in results])
+    mpc_mean = np.array([r["mpc_mean_soh"] for r in results])
+
+    classical_min = np.array([r["classical_min_soh"] for r in results])
+    mpc_min = np.array([r["mpc_min_soh"] for r in results])
+
+    runtime = np.array([r["runtime"] for r in results])
+    solve_calls = np.array([r["solve_system_calls"] for r in results])
+
+    return {
+        "num_tests": len(results),
+        "classical_mean_soh_avg": float(np.mean(classical_mean)),
+        "mpc_mean_soh_avg": float(np.mean(mpc_mean)),
+        "classical_min_soh_avg": float(np.mean(classical_min)),
+        "mpc_min_soh_avg": float(np.mean(mpc_min)),
+        "mpc_gain_mean_soh": float(np.mean(mpc_mean - classical_mean)),
+        "mpc_gain_min_soh": float(np.mean(mpc_min - classical_min)),
+        "avg_test_runtime": float(np.mean(runtime)),
+        "sum_test_runtime": float(np.sum(runtime)),
+        "avg_solve_system_calls": float(np.mean(solve_calls)),
+        "total_solve_system_calls": int(np.sum(solve_calls)),
+    }
+
+
+def plot_best_test_trajectories(
+    classical_modules,
+    mpc_modules,
+    dt_sec,
+    save_path="best_test_soc_soh.png",
+):
+    time_hours = np.arange(len(classical_modules[0].Traj)) * dt_sec / 3600.0
+
+    plt.figure(figsize=(12, 9))
+
+    plt.subplot(2, 1, 1)
     for i in range(3):
-        axes[0].plot(t_classical, classical_modules[i].soc_hist, label=f"Classical {classical_modules[i].module_id}")
-        axes[0].plot(t_mpc, mpc_modules[i].soc_hist, "--", label=f"MPC {mpc_modules[i].module_id}")
-    axes[0].set_title("SoC comparison")
-    axes[0].set_ylabel("SoC")
-    axes[0].grid(True)
-    axes[0].legend(ncol=2)
+        plt.plot(time_hours, classical_modules[i].Traj, label=f"Classical {classical_modules[i].id}")
+        plt.plot(time_hours, mpc_modules[i].Traj, "--", label=f"MPC {mpc_modules[i].id}")
+    plt.ylabel("SoC")
+    plt.title("Best Test: SoC over 10 Cycles")
+    plt.grid(True)
+    plt.legend(ncol=2)
 
+    plt.subplot(2, 1, 2)
     for i in range(3):
-        axes[1].plot(t_classical, classical_modules[i].soh_hist, label=f"Classical {classical_modules[i].module_id}")
-        axes[1].plot(t_mpc, mpc_modules[i].soh_hist, "--", label=f"MPC {mpc_modules[i].module_id}")
-    axes[1].set_title("SoH comparison")
-    axes[1].set_ylabel("SoH [%]")
-    axes[1].grid(True)
-    axes[1].legend(ncol=2)
-
-    for i in range(3):
-        axes[2].plot(t_classical, classical_modules[i].fce_hist, label=f"Classical {classical_modules[i].module_id}")
-        axes[2].plot(t_mpc, mpc_modules[i].fce_hist, "--", label=f"MPC {mpc_modules[i].module_id}")
-    axes[2].set_title("FCE comparison")
-    axes[2].set_ylabel("FCE")
-    axes[2].set_xlabel("Time [h]")
-    axes[2].grid(True)
-    axes[2].legend(ncol=2)
+        plt.plot(time_hours, classical_modules[i].SoHTraj, label=f"Classical {classical_modules[i].id}")
+        plt.plot(time_hours, mpc_modules[i].SoHTraj, "--", label=f"MPC {mpc_modules[i].id}")
+    plt.xlabel("Time [h]")
+    plt.ylabel("SoH [-]")
+    plt.title("Best Test: SoH over 10 Cycles")
+    plt.grid(True)
+    plt.legend(ncol=2)
 
     plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.show()
-
-    print("[PLOT] Plots displayed.")
-
-
-def summarize_results(classical_modules, mpc_modules):
-    print("\n[SUMMARY] Final results")
-    print("=" * 70)
-    for i in range(3):
-        c = classical_modules[i]
-        m = mpc_modules[i]
-        print(
-            f"{c.module_id}: "
-            f"Classical SoH={c.soh:.4f}, MPC SoH={m.soh:.4f}, "
-            f"Classical FCE={c.fce:.4f}, MPC FCE={m.fce:.4f}"
-        )
