@@ -385,9 +385,9 @@ def create_random_battery_modules(seed=None):
     sohs = rng.uniform(0.5, 1.0, size=3)
 
     BatteryModules = np.empty(3, dtype=object)
-    BatteryModules[0] = module(0.4, float(sohs[0]), 50.0, 0.2, 0.9, "M1", 50.0)
-    BatteryModules[1] = module(0.5, float(sohs[1]), 50.0, 0.2, 0.8, "M2", 50.0)
-    BatteryModules[2] = module(0.3, float(sohs[2]), 50.0, 0.2, 0.6, "M3", 50.0)
+    BatteryModules[0] = module(0.4, float(sohs[0]), 50.0, 0.1, 0.99, "M1", 50.0)
+    BatteryModules[1] = module(0.5, float(sohs[1]), 50.0, 0.1, 0.98, "M2", 50.0)
+    BatteryModules[2] = module(0.3, float(sohs[2]), 50.0, 0.1, 0.96, "M3", 50.0)
 
     return BatteryModules
 
@@ -431,7 +431,7 @@ def run_mpc_controller(
     dt_soc_per_amp = dt_hours / capacity_ah
 
     solve_system_calls = 0
-
+    T1_hist, T2_hist, T3_hist = [], [], []
     for cycle in range(n_cycles):
         for segment_id, (pack_current, duration_steps) in enumerate(segments):
             solve_system_calls += 1
@@ -489,13 +489,17 @@ def run_mpc_controller(
                     )
 
                     T1, T2, T3 = UpdateLimits(T1, T2, T3, delta_traj)
+                    T1_hist.append(T1.copy())
+                    T2_hist.append(T2.copy())
+                    T3_hist.append(T3.copy())
+
                     u = u_traj[0, :]
 
                 for battery, current in zip(BatteryModules, u):
                     battery.LF = np.append(battery.LF, current)
                     update_soh_module(battery, current, dt_hours, soh_params)
 
-    return BatteryModules, solve_system_calls
+    return BatteryModules, solve_system_calls, T1_hist, T2_hist, T3_hist
 
 
 def run_single_test(
@@ -525,7 +529,7 @@ def run_single_test(
         soh_params,
     )
 
-    mpc_modules, solve_system_calls = run_mpc_controller(
+    mpc_modules, solve_system_calls, T1_hist, T2_hist, T3_hist = run_mpc_controller(
         mpc_modules,
         dt_hours,
         n_cycles,
@@ -552,6 +556,9 @@ def run_single_test(
         "mpc_min_soh": float(np.min(mpc_final_soh)),
         "solve_system_calls": solve_system_calls,
         "runtime": elapsed,
+        "T1_hist": T1_hist,
+        "T2_hist": T2_hist,
+        "T3_hist": T3_hist,
     }
 
     if keep_trajectories:
@@ -590,30 +597,71 @@ def plot_best_test_trajectories(
     classical_modules,
     mpc_modules,
     dt_sec,
+    T1_traj=None,
+    T2_traj=None,
+    T3_traj=None,
     save_path="best_test_soc_soh.png",
 ):
     time_hours = np.arange(len(classical_modules[0].Traj)) * dt_sec / 3600.0
 
-    plt.figure(figsize=(12, 9))
+    plt.figure(figsize=(14, 12))
 
-    plt.subplot(2, 1, 1)
+    # =========================
+    # SoC plot
+    # =========================
+    plt.subplot(3, 1, 1)
     for i in range(3):
-        plt.plot(time_hours, classical_modules[i].Traj, label=f"Classical {classical_modules[i].id}")
-        plt.plot(time_hours, mpc_modules[i].Traj, "--", label=f"MPC {mpc_modules[i].id}")
+        plt.plot(time_hours, classical_modules[i].Traj,
+                 label=f"Classical {classical_modules[i].id}")
+        plt.plot(time_hours, mpc_modules[i].Traj, "--",
+                 label=f"MPC {mpc_modules[i].id}")
+
     plt.ylabel("SoC")
     plt.title("Best Test: SoC over 10 Cycles")
     plt.grid(True)
     plt.legend(ncol=2)
 
-    plt.subplot(2, 1, 2)
+    # =========================
+    # SoH plot
+    # =========================
+    plt.subplot(3, 1, 2)
     for i in range(3):
-        plt.plot(time_hours, classical_modules[i].SoHTraj, label=f"Classical {classical_modules[i].id}")
-        plt.plot(time_hours, mpc_modules[i].SoHTraj, "--", label=f"MPC {mpc_modules[i].id}")
+        plt.plot(time_hours, classical_modules[i].SoHTraj,
+                 label=f"Classical {classical_modules[i].id}")
+        plt.plot(time_hours, mpc_modules[i].SoHTraj, "--",
+                 label=f"MPC {mpc_modules[i].id}")
+
     plt.xlabel("Time [h]")
     plt.ylabel("SoH [-]")
     plt.title("Best Test: SoH over 10 Cycles")
     plt.grid(True)
     plt.legend(ncol=2)
+
+    # =========================
+    # T1, T2, T3 plot (MPC only)
+    # =========================
+    if T1_traj is not None and T2_traj is not None and T3_traj is not None:
+        plt.subplot(3, 1, 3)
+
+        T_time = np.arange(len(T1_traj))
+
+        plt.step(T_time, [t[0] for t in T1_traj], label="T1 M1", where="post")
+        plt.step(T_time, [t[1] for t in T1_traj], label="T1 M2", where="post")
+        plt.step(T_time, [t[2] for t in T1_traj], label="T1 M3", where="post")
+
+        plt.step(T_time, [t[0] for t in T2_traj], "--", label="T2 M1", where="post")
+        plt.step(T_time, [t[1] for t in T2_traj], "--", label="T2 M2", where="post")
+        plt.step(T_time, [t[2] for t in T2_traj], "--", label="T2 M3", where="post")
+
+        plt.step(T_time, [t[0] for t in T3_traj], ":", label="T3 M1", where="post")
+        plt.step(T_time, [t[1] for t in T3_traj], ":", label="T3 M2", where="post")
+        plt.step(T_time, [t[2] for t in T3_traj], ":", label="T3 M3", where="post")
+
+        plt.xlabel("MPC Step Index")
+        plt.ylabel("T allocation")
+        plt.title("MPC Switching Budget (T1, T2, T3)")
+        plt.grid(True)
+        plt.legend(ncol=3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches="tight")

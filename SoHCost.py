@@ -156,7 +156,7 @@ def SortLoad(BatteryModules, SoC):
                     BatteryModules[j] = T
     return BatteryModules
     
-def PlotBatteries(time, Tl, BatteryModules, flag):
+def PlotBatteries_v1(time, Tl, BatteryModules, flag):
       
     # Plot each with a predefined symbol and color
     plt.plot(time, BatteryModules[0].Traj, 'ro-', label=f"SoC {BatteryModules[0].id}")  # Red with circles
@@ -213,7 +213,67 @@ def PlotBatteries(time, Tl, BatteryModules, flag):
     filename = f"my_figure_{rand_num}.pdf"
     plt.savefig(filename, bbox_inches="tight")
     plt.show()
-    
+
+def PlotBatteries(time, Tl, BatteryModules, flag):
+
+    # --- FIX 1: sort modules by ID (consistent plotting order) ---
+    modules_sorted = sorted(BatteryModules, key=lambda b: b.id)
+
+    # Extract trajectories safely
+    soc_trajs = [b.Traj for b in modules_sorted]
+    lf_trajs = [b.LF for b in modules_sorted]
+    labels = [b.id for b in modules_sorted]
+
+    # --- FIX 2: time must match trajectory length ---
+    time_soc = np.linspace(0, Tl/60, len(soc_trajs[0]))
+
+    # ================= SoC Plot =================
+    plt.figure()
+    styles = ['r-', 'b--', 'g-.']
+
+    for i in range(3):
+        plt.plot(time_soc, soc_trajs[i], styles[i], label=f"SoC {labels[i]}")
+
+    plt.xlabel("Time (min)")
+    plt.ylabel("SoC")
+    plt.title("State of Charge Over Time")
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f"my_soc_{random.randint(1000,9999)}.pdf", bbox_inches="tight")
+    plt.show()
+
+    # ================= LF Plot =================
+    time_lf = np.linspace(0, Tl/60, len(lf_trajs[0]))
+
+    fig, ax = plt.subplots()
+
+    for i in range(3):
+        ax.plot(time_lf, lf_trajs[i], styles[i], label=f"LF {labels[i]}")
+
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Current / LF")
+    ax.set_title("Load Factor Over Time")
+    ax.legend(loc='upper left')
+    ax.grid(True)
+
+    # --- Optional zoom ---
+    if flag:
+        axins = inset_axes(ax, width="30%", height="30%", loc="upper right")
+
+        for i in range(3):
+            axins.step(time_lf, lf_trajs[i], styles[i])
+
+        axins.set_xlim(7, 7.1)
+        axins.grid(True)
+
+        mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="red")
+
+    plt.tight_layout()
+    plt.savefig(f"my_lf_{random.randint(1000,9999)}.pdf", bbox_inches="tight")
+    plt.show()
+
 def solve_system_v1(a_list, l1, l2, l3, P):
     N = len(a_list)
 
@@ -488,8 +548,10 @@ PowerSec = 1/(15*60)
 LF = np.array([0.6,0.3,0.1])
 LF = np.sort(LF)[::-1]
 
-AList = [BatteryModules[i].SoCmax-BatteryModules[i].SoC for i in range(N)]
+#AList = [BatteryModules[i].SoCmax-BatteryModules[i].SoC for i in range(N)]     #charge
+AList = [BatteryModules[i].SoC-BatteryModules[i].SoCmin for i in range(N)]       #discharge
 result = solve_system_v1(AList, LF[0], LF[1], LF[2], PowerSec)
+PowerSec = -1/(15*60)                                                            #discharge
 T1 = result['T1']
 T2 = result['T2']
 T3 = result['T3']

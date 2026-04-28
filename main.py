@@ -147,6 +147,9 @@ def main():
         classical_modules=best_detailed["classical_modules"],
         mpc_modules=best_detailed["mpc_modules"],
         dt_sec=dt_sec,
+        T1_traj=best_detailed["T1_hist"],
+        T2_traj=best_detailed["T2_hist"],
+        T3_traj=best_detailed["T3_hist"],
         save_path="best_test_soc_soh.png",
     )
 
