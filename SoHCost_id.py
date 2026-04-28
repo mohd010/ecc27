@@ -138,6 +138,7 @@ def MPCsession_v1(BatteryModules, dt, LF, N, T1, T2, T3):
         print('model infeasible')
     return x_traj, u_traj, delta_traj
 
+
 def SortLoad(BatteryModules, SoC):
     N = len(BatteryModules)
     if SoC:
@@ -514,14 +515,18 @@ def UpdateLimits(T1,T2,T3,delta_traj):
     
     return T1, T2, T3
     
-N = 3
-BatteryModules = np.empty(N, dtype=object)
+Nb = 3
+BatteryModules = np.empty(Nb, dtype=object)
 # BatteryModules[0] = module(0.6, 1, 1, 0.2, 0.9, "M1")
 # BatteryModules[1] = module(0.3, 0.7, 1, 0.2, 0.8, "M2")
 # BatteryModules[2] = module(0.5, 0.4, 1, 0.2, 0.7, "M3")
-BatteryModules[0] = module(0.4, 1, 1, 0.2, 0.9, "M1")
-BatteryModules[1] = module(0.5, 0.7, 1, 0.2, 0.8, "M2")
-BatteryModules[2] = module(0.3, 0.4, 1, 0.2, 0.6, "M3")
+BatteryModules[0] = module(0.4, 0.96, 1, 0.1, 0.99, "M1")
+BatteryModules[1] = module(0.5, 0.91, 1, 0.1, 0.98, "M2")
+BatteryModules[2] = module(0.3, 0.9863, 1, 0.1, 0.96, "M3")
+
+# BatteryModules[0] = module(0.4, 0.94, 1, 0.1, 0.99, "M1")
+# BatteryModules[1] = module(0.5, 0.97, 1, 0.1, 0.98, "M2")
+# BatteryModules[2] = module(0.3, 1, 1, 0.1, 0.96, "M3")
 
 J = 6
 SM = np.empty(J, dtype=object)
@@ -543,21 +548,13 @@ level[5] = np.array([0,-1,-1])
 level[6] = np.array([-1,-1,-1])
 Imax = 35
 
-Igrid = 30
-PowerSec = 1/(15*60)
+Egrid = 1
+PowerSec = Egrid/(15*60)
 LF = np.array([0.6,0.3,0.1])
 LF = np.sort(LF)[::-1]
 
-#AList = [BatteryModules[i].SoCmax-BatteryModules[i].SoC for i in range(N)]     #charge
-AList = [BatteryModules[i].SoC-BatteryModules[i].SoCmin for i in range(N)]       #discharge
-result = solve_system_v1(AList, LF[0], LF[1], LF[2], PowerSec)
-PowerSec = -1/(15*60)                                                            #discharge
-T1 = result['T1']
-T2 = result['T2']
-T3 = result['T3']
-
 Th = 50
-Tsim = 9*60
+Tsim = 40*60
 plt.rcParams.update({'font.size': 17})   # change 14 → any size you prefer
 
 
@@ -573,12 +570,21 @@ for tl in range(Tsim):
 timeD = np.linspace(0, Tsim/60, Tsim+1)  # 100 points from 0 to 10 seconds
 PlotBatteries(timeD, Tsim, BatteryModules, True)
 ####### Section on MPC
-Tsim = 17*60
+Tsim = 40*60
 timeD = np.linspace(0, Tsim/60, Tsim+1)  # 100 points from 0 to 10 seconds
 for battery in BatteryModules:
     battery.reset()
 N = 5
 BatteryModules = SortLoad(BatteryModules, False)
+
+AList = [BatteryModules[i].SoCmax-BatteryModules[i].SoC for i in range(Nb)]     #charge
+# AList = [BatteryModules[i].SoC-BatteryModules[i].SoCmin for i in range(Nb)]       #discharge
+result = solve_system_v1(AList, LF[0], LF[1], LF[2], PowerSec)
+# PowerSec = -Egrid/(15*60)                                                            #discharge
+T1 = result['T1']
+T2 = result['T2']
+T3 = result['T3']
+
 startTsim = time.time()
 for tl in range(Tsim):
     print(f"MPC iteration {tl} out of {Tsim}")

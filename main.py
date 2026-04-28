@@ -20,7 +20,7 @@ def main():
     print("=" * 80)
 
     num_tests = 20
-    n_cycles = 10
+    n_cycles = 2
     horizon = 5
     dt_sec = 1.0
 
